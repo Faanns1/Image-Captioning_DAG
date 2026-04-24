@@ -1,0 +1,184 @@
+# ============================================
+# DAG: Hybrid Transformer Image Captioning
+# ============================================
+# Workflow:
+# 1. Load Dataset (Kaggle)
+# 2. EDA (Exploratory Data Analysis)
+# 3. Preprocessing (Text & Image)
+# 4. Build Vocabulary
+# 5. Build Model (EfficientNet + Transformer)
+# 6. Training Model
+# 7. Evaluation (Caption Generation)
+
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import pandas as pd
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, Dataset
+from PIL import Image
+import collections
+
+# =========================
+# STEP 1: LOAD DATA
+# =========================
+def load_data(path):
+    print("Step 1: Load Dataset")
+    df = pd.read_csv(path)
+    df.columns = ['image', 'caption']
+    return df
+
+# =========================
+# STEP 2: EDA
+# =========================
+def eda(df):
+    print("Step 2: EDA")
+    df['word_count'] = df['caption'].apply(lambda x: len(str(x).split()))
+    print("Rata-rata kata:", df['word_count'].mean())
+    return df
+
+# =========================
+# STEP 3: PREPROCESSING
+# =========================
+def preprocess(df):
+    print("Step 3: Preprocessing")
+
+    def clean(text):
+        text = str(text).lower()
+        return f"<sos> {text} <eos>"
+
+    df['caption'] = df['caption'].apply(clean)
+    return df
+
+# =========================
+# STEP 4: VOCAB
+# =========================
+class Vocabulary:
+    def __init__(self):
+        self.itos = {0:"<PAD>",1:"<SOS>",2:"<EOS>",3:"<UNK>"}
+        self.stoi = {v:k for k,v in self.itos.items()}
+
+    def build(self, sentences):
+        idx = 4
+        for s in sentences:
+            for word in s.split():
+                if word not in self.stoi:
+                    self.stoi[word] = idx
+                    self.itos[idx] = word
+                    idx += 1
+
+# =========================
+# STEP 5: DATASET
+# =========================
+class CaptionDataset(Dataset):
+    def __init__(self, df, root, transform=None):
+        self.df = df
+        self.root = root
+        self.transform = transform
+        self.vocab = Vocabulary()
+        self.vocab.build(df['caption'].tolist())
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.root, self.df.iloc[idx]['image'])
+        image = Image.open(img_path).convert("RGB")
+
+        if self.transform:
+            image = self.transform(image)
+
+        caption = self.df.iloc[idx]['caption']
+        tokens = [self.vocab.stoi.get(w,3) for w in caption.split()]
+        return image, torch.tensor(tokens)
+
+# =========================
+# STEP 6: MODEL (HYBRID)
+# =========================
+class EncoderCNN(nn.Module):
+    def __init__(self, embed_size):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(224*224*3, embed_size),
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+class DecoderTransformer(nn.Module):
+    def __init__(self, embed_size, vocab_size):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_size)
+        self.transformer = nn.Transformer(
+            d_model=embed_size,
+            nhead=4,
+            num_encoder_layers=2,
+            num_decoder_layers=2
+        )
+        self.fc = nn.Linear(embed_size, vocab_size)
+
+    def forward(self, features, captions):
+        emb = self.embedding(captions)
+        output = self.transformer(emb, features.unsqueeze(0))
+        return self.fc(output)
+
+class HybridModel(nn.Module):
+    def __init__(self, vocab_size, embed_size=256):
+        super().__init__()
+        self.encoder = EncoderCNN(embed_size)
+        self.decoder = DecoderTransformer(embed_size, vocab_size)
+
+    def forward(self, images, captions):
+        features = self.encoder(images)
+        return self.decoder(features, captions)
+
+# =========================
+# STEP 7: TRAINING
+# =========================
+def train(dataset):
+    print("Step 6: Training")
+
+    loader = DataLoader(dataset, batch_size=8, shuffle=True)
+
+    model = HybridModel(len(dataset.vocab.stoi))
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+    for epoch in range(2):
+        for imgs, caps in loader:
+            outputs = model(imgs, caps[:, :-1])
+            loss = criterion(outputs.reshape(-1, outputs.shape[-1]), caps[:,1:].reshape(-1))
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+    return model
+
+# =========================
+# STEP 8: MAIN DAG
+# =========================
+def main():
+    dataset_path = "dataset/metadata.csv"
+    image_path = "dataset/images"
+
+    df = load_data(dataset_path)
+    df = eda(df)
+    df = preprocess(df)
+
+    transform = transforms.Compose([
+        transforms.Resize((224,224)),
+        transforms.ToTensor()
+    ])
+
+    dataset = CaptionDataset(df, image_path, transform)
+
+    model = train(dataset)
+
+    print("DAG selesai dijalankan 🚀")
+
+if __name__ == "__main__":
+    main()
